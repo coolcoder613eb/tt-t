@@ -7,3 +7,5 @@ edition = "2021"
 irc = "1.0.0"
 rocket = "0.5.1"
 tokio = { version = "1", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"

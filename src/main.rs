@@ -6,6 +6,7 @@ use rocket::routes;
 use rocket::tokio::sync::{mpsc, oneshot};
 use rocket::tokio::task;
 use std::time::Duration;
+use tracing::{error, info, warn};
 
 #[derive(Clone)]
 struct IrcClientHandle {
@@ -23,10 +24,8 @@ macro_rules! irc_command_handler {
         async fn $name(username: String, handle: &rocket::State<IrcClientHandle>) -> String {
             let (response_tx, response_rx) = oneshot::channel();
 
-            // Format the command using the provided template
             let command = format!($command_template, username);
 
-            // Send the command to the IRC client
             if handle
                 .sender
                 .send(IrcMessage::Send(command, response_tx))
@@ -36,10 +35,8 @@ macro_rules! irc_command_handler {
                 return "Failed to send message to IRC client".to_string();
             }
 
-            // Wait for and process the response
             match tokio::time::timeout(Duration::from_secs(10), response_rx).await {
                 Ok(Ok(response)) => {
-                    // Strip the prefix if it exists
                     if let Some(r) = response.strip_prefix($response_prefix) {
                         r.to_string()
                     } else {
@@ -60,13 +57,8 @@ irc_command_handler!(
     ":[\u{3}03Weather\u{3}] "
 );
 
-#[rocket::main]
-async fn main() -> Result<(), rocket::Error> {
-    let (tx, mut rx) = mpsc::channel::<IrcMessage>(100);
-    let irc_handle = IrcClientHandle { sender: tx.clone() };
-
-    // Spawn a task to handle IRC communications
-    task::spawn(async move {
+async fn connect_and_run_irc(mut rx: mpsc::Receiver<IrcMessage>) {
+    loop {
         let config = Config {
             nickname: Some("tt-t-bot".to_owned()),
             server: Some("irc.tilde.chat".to_owned()),
@@ -76,46 +68,61 @@ async fn main() -> Result<(), rocket::Error> {
             ..Default::default()
         };
 
-        // Create the client
-        let mut client = Client::from_config(config).await.unwrap();
-        client.identify().unwrap();
+        match Client::from_config(config).await {
+            Ok(mut client) => {
+                if let Err(e) = client.identify() {
+                    error!("Failed to identify with IRC server: {:?}", e);
+                    continue;
+                }
 
-        // Get a stream of messages
-        let mut stream = client.stream().unwrap();
+                let mut stream = client.stream().unwrap();
 
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                IrcMessage::Send(irc_message, response_tx) => {
-                    // Drain any existing messages in the stream first
-                    while let Some(Some(Ok(msg))) = stream.next().now_or_never() {
-                        println!("{}", msg)
-                    }
-                    println!("End.");
+                while let Some(msg) = rx.recv().await {
+                    match msg {
+                        IrcMessage::Send(irc_message, response_tx) => {
+                            // Drain any pending messages
+                            while let Some(Some(Ok(msg))) = stream.next().now_or_never() {
+                                info!("Received: {:?}", msg);
+                            }
 
-                    // Send the message
-                    if client.send_privmsg("tildebot", &irc_message).is_ok() {
-                        // Wait for and capture the specific reply
-                        while let Some(Ok(reply)) = stream.next().await {
-                            // Check if the reply is relevant
-                            let rs = reply.to_string();
-
-                            println!("{:#?}", rs);
-                            let r = if let Some(r) = rs.split("tt-t-bot ").last() {
-                                r
+                            // Attempt to send message
+                            if client.send_privmsg("tildebot", &irc_message).is_ok() {
+                                while let Some(Ok(reply)) = stream.next().await {
+                                    let rs = reply.to_string();
+                                    if let Some(r) = rs.split("tt-t-bot ").last() {
+                                        let _ = response_tx.send(r.to_string());
+                                        break;
+                                    }
+                                }
                             } else {
-                                "Failed to receive reply"
-                            };
-                            let _ = response_tx.send(r.to_string());
-                            break;
+                                let _ = response_tx.send("Failed to send IRC command".to_string());
+                            }
                         }
-                    } else {
-                        let _ = response_tx.send("Failed to send IRC command".to_string());
                     }
                 }
             }
+            Err(e) => {
+                error!("Failed to connect to IRC server: {:?}", e);
+            }
         }
-    });
 
+        warn!("Disconnected from IRC server. Reconnecting in 5 seconds...");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+#[rocket::main]
+async fn main() -> Result<(), rocket::Error> {
+    // Set up logging
+    tracing_subscriber::fmt().init();
+
+    let (tx, rx) = mpsc::channel::<IrcMessage>(100);
+    let irc_handle = IrcClientHandle { sender: tx.clone() };
+
+    // Start IRC task
+    task::spawn(connect_and_run_irc(rx));
+
+    // Start Rocket web server
     rocket::build()
         .manage(irc_handle)
         .mount("/", routes![time, weather])
