@@ -1,5 +1,4 @@
 use irc::client::prelude::*;
-use rocket::futures::FutureExt;
 use rocket::futures::StreamExt;
 use rocket::get;
 use rocket::routes;
@@ -77,27 +76,39 @@ async fn connect_and_run_irc(mut rx: mpsc::Receiver<IrcMessage>) {
 
                 let mut stream = client.stream().unwrap();
 
-                while let Some(msg) = rx.recv().await {
-                    match msg {
-                        IrcMessage::Send(irc_message, response_tx) => {
-                            // Drain any pending messages
-                            while let Some(Some(Ok(msg))) = stream.next().now_or_never() {
-                                info!("Received: {:?}", msg);
-                            }
-
-                            // Attempt to send message
-                            if client.send_privmsg("tildebot", &irc_message).is_ok() {
-                                while let Some(Ok(reply)) = stream.next().await {
-                                    let rs = reply.to_string();
-                                    if let Some(r) = rs.split("tt-t-bot ").last() {
-                                        let _ = response_tx.send(r.to_string());
-                                        break;
+                // Handle incoming messages including PINGs
+                loop {
+                    tokio::select! {
+                        Some(msg) = rx.recv() => {
+                            match msg {
+                                IrcMessage::Send(irc_message, response_tx) => {
+                                    if client.send_privmsg("tildebot", &irc_message).is_ok() {
+                                        while let Some(Ok(reply)) = stream.next().await {
+                                            let rs = reply.to_string();
+                                            if let Some(r) = rs.split("tt-t-bot ").last() {
+                                                let _ = response_tx.send(r.to_string());
+                                                break;
+                                            }
+                                        }
+                                    } else {
+                                        let _ = response_tx.send("Failed to send IRC command".to_string());
                                     }
                                 }
-                            } else {
-                                let _ = response_tx.send("Failed to send IRC command".to_string());
                             }
                         }
+                        Some(Ok(message)) = stream.next() => {
+                            match message.command {
+                                Command::PING(server1, server2) => {
+                                    if let Err(e) = client.send(Command::PONG(server1,server2)) {
+                                        error!("Failed to send PONG: {:?}", e);
+                                    }
+                                }
+                                _ => {
+                                    info!("Received: {:?}", message);
+                                }
+                            }
+                        }
+                        else => break,
                     }
                 }
             }
